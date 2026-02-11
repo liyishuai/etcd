@@ -1168,6 +1168,142 @@ func testV3LeaseTimeToLiveWithLeaderChanged(t *testing.T, fpName string) {
 	require.NoError(t, <-errCh)
 }
 
+// TestV3LeaseKeysDeletedBeforeExpiry reproduces the race condition described in
+// https://github.com/etcd-io/etcd/issues/14758 using natural lease expiry.
+//
+// The lease expires on its own (no manual Revoke). The server's runLoop detects
+// the expired lease and proposes LeaseRevoke through Raft. Meanwhile, a client
+// KeepAlive was in-flight and gets delayed by a failpoint. The interleaving:
+//
+//  1. Client sends KeepAlive ~2s before lease expires.
+//  2. LeaseRenew → waitAppliedIndex (succeeds, nothing pending) → Renew()
+//     passes l.expired() check → hits beforeCheckpointInLeaseRenew → sleeps.
+//  3. Lease naturally expires. revokeExpiredLeases() detects it, proposes
+//     LeaseRevoke through Raft.
+//  4. Raft commits. Apply goroutine calls Revoke() → deletes keys (Detach
+//     from itemSet) → hits afterLeaseRevokeDeleteKeys → pauses.
+//  5. Renew wakes up, acquires Lock, finds lease still in leaseMap, calls
+//     refresh() → positive TTL. Returns TTL to gRPC handler.
+//  6. Client receives KeepAlive response with TTL > 0 (lease "alive").
+//  7. Client immediately reads keys → all deleted, within lease validity
+//     window (before keepAliveSendTime + returnedTTL).
+//  8. Revoke resumes, deletes lease from leaseMap, apply unblocks.
+//
+// The client observes: KeepAlive said TTL > 0, but keys are gone.
+func TestV3LeaseKeysDeletedBeforeExpiry(t *testing.T) {
+	integration.SkipIfNoGoFail(t)
+	integration.BeforeTest(t)
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
+	defer clus.Terminate(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	client := clus.RandClient()
+	lc := integration.ToGRPC(client).Lease
+	kvc := integration.ToGRPC(client).KV
+
+	// Grant a lease with 10s TTL. This gives enough margin so that the
+	// KeepAlive response arrives before keepAliveSendTime + returnedTTL.
+	lresp, err := lc.LeaseGrant(ctx, &pb.LeaseGrantRequest{TTL: 10})
+	require.NoError(t, err)
+	leaseID := lresp.ID
+	t.Logf("Lease %x granted with TTL=%d", leaseID, lresp.TTL)
+
+	// Attach keys to the lease.
+	numKeys := 3
+	for i := range numKeys {
+		_, err := kvc.Put(ctx, &pb.PutRequest{
+			Key:   []byte(fmt.Sprintf("lease-key-%d", i)),
+			Value: []byte(fmt.Sprintf("val-%d", i)),
+			Lease: leaseID,
+		})
+		require.NoError(t, err)
+	}
+
+	// Verify keys are attached.
+	ttlResp, err := lc.LeaseTimeToLive(ctx, &pb.LeaseTimeToLiveRequest{ID: leaseID, Keys: true})
+	require.NoError(t, err)
+	require.Len(t, ttlResp.Keys, numKeys)
+
+	// Open a KeepAlive stream early (before enabling failpoints).
+	lac, err := lc.LeaseKeepAlive(ctx)
+	require.NoError(t, err)
+
+	// Enable failpoints to widen the race window:
+	//
+	// beforeCheckpointInLeaseRenew: delays Renew() by 5s AFTER it passes
+	// l.expired() but BEFORE it acquires Lock to refresh.
+	//
+	// afterLeaseRevokeDeleteKeys: delays Revoke() by 5s AFTER deleting
+	// keys (Detach from itemSet) but BEFORE removing lease from leaseMap.
+	//
+	// Timeline:
+	//   t=0s:     Lease granted (TTL=10s)
+	//   t=8s:     KeepAlive sent → Renew passes expired() → sleeps 5s
+	//   t=10s:    Lease expires naturally
+	//   t=11-12s: revokeExpiredLeases → Raft → Revoke → keys deleted → pauses 5s
+	//   t=13s:    Renew wakes → finds lease → refresh → returns TTL=10
+	//   t=13s:    Client reads keys immediately → keys gone
+	//   t=13s:    Assert: now < t=8 + 10 = t=18 ✓
+	//   t=16-17s: Revoke resumes → lease deleted → apply unblocks
+	require.NoError(t, gofail.Enable("beforeCheckpointInLeaseRenew", `sleep("5s")`))
+	require.NoError(t, gofail.Enable("afterLeaseRevokeDeleteKeys", `sleep("5s")`))
+	t.Cleanup(func() {
+		_ = gofail.Disable("beforeCheckpointInLeaseRenew")
+		_ = gofail.Disable("afterLeaseRevokeDeleteKeys")
+	})
+
+	// Wait until ~2s before lease expires, then send KeepAlive.
+	// Renew() will pass the expired() check (lease has ~2s remaining)
+	// and then sleep 5s at the failpoint.
+	time.Sleep(time.Duration(lresp.TTL-2) * time.Second)
+	keepAliveSendTime := time.Now()
+	require.NoError(t, lac.Send(&pb.LeaseKeepAliveRequest{ID: leaseID}))
+	t.Logf("KeepAlive sent at %v (~%ds after grant, ~2s before expiry)", keepAliveSendTime, lresp.TTL-2)
+
+	// Receive the KeepAlive response. Renew wakes up after 5s, finds the
+	// lease (Revoke is paused after deleting keys), refreshes it, and
+	// returns TTL > 0 to the gRPC handler.
+	kaResp, err := lac.Recv()
+	require.NoError(t, err)
+	t.Logf("KeepAlive response: ID=%x, TTL=%d", kaResp.ID, kaResp.TTL)
+	require.Equal(t, leaseID, kaResp.ID)
+	require.Positive(t, kaResp.TTL,
+		"KeepAlive should report positive TTL (Renew refreshed the lease)")
+
+	// Immediately read keys. If the lease was truly renewed, keys should
+	// exist until at least keepAliveSendTime + returned TTL.
+	var keysRemaining int
+	for i := range numKeys {
+		rresp, rerr := kvc.Range(ctx, &pb.RangeRequest{
+			Key: []byte(fmt.Sprintf("lease-key-%d", i)),
+		})
+		require.NoError(t, rerr)
+		keysRemaining += len(rresp.Kvs)
+	}
+	readCompleteTime := time.Now()
+	leaseDeadline := keepAliveSendTime.Add(time.Duration(kaResp.TTL) * time.Second)
+	t.Logf("Keys remaining: %d/%d (read completed at %v, lease should be valid until %v)",
+		keysRemaining, numKeys, readCompleteTime, leaseDeadline)
+
+	// The read must complete within the lease validity window. This proves
+	// the keys disappeared while the client believed the lease was alive.
+	require.True(t, readCompleteTime.Before(leaseDeadline),
+		"key read must complete before keepAlive send time + returned TTL")
+
+	// This is the bug: the client received KeepAlive TTL > 0, indicating
+	// the lease was "successfully renewed", but all attached keys have been
+	// deleted by the concurrent Revoke.
+	require.Zero(t, keysRemaining,
+		"expected all keys deleted despite KeepAlive returning TTL > 0")
+
+	// Cleanup: disable failpoints and let revoke complete.
+	_ = gofail.Disable("afterLeaseRevokeDeleteKeys")
+	_ = gofail.Disable("beforeCheckpointInLeaseRenew")
+}
+
 // acquireLeaseAndKey creates a new lease and creates an attached key.
 func acquireLeaseAndKey(clus *integration.Cluster, key string) (int64, error) {
 	// create lease
